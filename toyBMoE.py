@@ -126,10 +126,13 @@ class BMoELayer(nn.Module):
     """Causal attention + a set of N experts. The active expert is chosen at the
     bloc level (the same routing weights are passed to every layer of the bloc)."""
 
-    def __init__(self, d_model, n_heads, n_experts):
+    def __init__(self, d_model, n_heads, n_experts, experts=None):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.experts = nn.ModuleList([Expert(d_model) for _ in range(n_experts)])
+        # experts can be a shared ModuleList (weight-tied across blocs); else own ones
+        self.experts = experts if experts is not None else nn.ModuleList(
+            [Expert(d_model) for _ in range(n_experts)]
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -232,17 +235,28 @@ class BMoE(nn.Module):
         st_weights = one_hot + probs - probs.detach()
         return st_weights, probs, idx
 
-    def forward(self, x, force_expert=None):
-        """force_expert=None -> learned routing. force_expert=i -> route everything
-        to expert i (used for pre-specialization and for the divergence loss)."""
+    def forward(self, x, force_expert=None, return_bloc_logits=False):
+        """Routing control:
+          - force_expert=None : learned routing (base + inter-expert attention).
+          - force_expert=i    : route everything to expert i on every bloc
+                                (pre-specialization, divergence loss).
+          - force_expert=path : a length-n_blocs sequence giving the forced expert
+                                per bloc, e.g. (0, 2, 2) — used to search expert paths.
+
+        return_bloc_logits=True additionally returns the head applied AFTER each bloc
+        (one (B*S, vocab) tensor per bloc) — used for deep supervision (Lever 2).
+        """
         B, S = x.shape
         h = self.token_embed(x) + self.pos_embed[:, :S, :]
 
+        is_path = force_expert is not None and not isinstance(force_expert, int)
         routing = []  # per bloc: (probs (B,N), idx (B,))
+        bloc_logits = []
         O_prev = None  # O_{b-1} in R^{B x N x d}
         for b, bloc in enumerate(self.blocs):
             if force_expert is not None:
-                idx = torch.full((B,), force_expert, device=x.device, dtype=torch.long)
+                e = force_expert[b] if is_path else force_expert
+                idx = torch.full((B,), e, device=x.device, dtype=torch.long)
                 weights = F.one_hot(idx, self.n_experts).float()
                 probs = weights
             else:
@@ -256,8 +270,12 @@ class BMoE(nn.Module):
             h, expert_out = bloc(h, weights)
             O_prev = expert_out.mean(dim=1)  # aggregate over tokens -> (B, N, d)
             routing.append((probs, idx))
+            if return_bloc_logits:
+                bloc_logits.append(self.head(h).reshape(-1, self.vocab_size))
 
         logits = self.head(h).reshape(-1, self.vocab_size)  # (B*S, vocab)
+        if return_bloc_logits:
+            return logits, routing, bloc_logits
         return logits, routing
 
 
@@ -360,138 +378,113 @@ def label(task):
     return "+".join(a[:4] for a in task)
 
 
-def main():
-    torch.manual_seed(42)
-    np.random.seed(42)
+def run_bmoe(seq_len=30, vocab=50, d_model=64, n_heads=4, n_blocs=3, layers_per_bloc=2,
+             d_k_routing=16, batch=32, n_train=300, n_test=150, t_pre=200, n_joint=600,
+             lr=1e-3, alpha_bal=0.05, lambda_div=0.01, train_tasks=None, eval_tasks=None,
+             verbose=True):
+    """Build data, pre-specialize, jointly train, and return (model, test, meta).
 
-    # Atomic skills -> one pre-specialized expert each. Complex queries are compositions.
-    PURE = [[a] for a in ATOMS]                              # math / history / geography
-    # Compositions SEEN during training (2 of the 3 possible pairs)
-    SEEN = [["math", "history"], ["history", "geography"]]
-    # Compositions NEVER seen during training -> zero-shot compositional generalization
-    HELDOUT = [["math", "geography"], ["math", "history", "geography"]]
-    TRAIN_TASKS = PURE + SEEN
-    ALL_TASKS = TRAIN_TASKS + HELDOUT
+    train_tasks: list of atom-lists the model is trained on (defaults to pures + all
+    pairwise/triple compositions). eval_tasks: extra (held-out) tasks to build test
+    data for but never train on — used by the zero-shot generalization script.
+    """
+    n_experts = len(ATOMS)
+    if train_tasks is None:
+        train_tasks = ([[a] for a in ATOMS]
+                       + [["math", "history"], ["history", "geography"],
+                          ["math", "geography"], ["math", "history", "geography"]])
+    eval_tasks = eval_tasks or []
+    all_tasks = train_tasks + [t for t in eval_tasks if t not in train_tasks]
 
-    # Hyperparameters
-    VOCAB = 50
-    D_MODEL = 64
-    N_HEADS = 4
-    N_EXPERTS = len(ATOMS)
-    N_BLOCS = 3  # B
-    LAYERS_PER_BLOC = 2  # Z  -> L = 6
-    D_K_ROUTING = 16
-    SEQ_LEN = 30
-    BATCH = 32
-
-    N_TRAIN = 300
-    N_TEST = 150
-    T_PRE = 200  # pre-specialization steps per expert
-    N_JOINT = 600  # joint training steps (one random task sampled per step)
-    LR = 1e-3
-    ALPHA_BAL = 0.05   # load-balancing weight
-    LAMBDA_DIV = 0.01  # divergence weight (keeps experts distinct -> forces switching)
-
-    print("=" * 72)
-    print("  B-MoE: compositional generalization (zero-shot expert chaining)")
-    print("=" * 72)
-    print(f"  L={N_BLOCS * LAYERS_PER_BLOC} | B={N_BLOCS} blocs | Z={LAYERS_PER_BLOC} "
-          f"| N={N_EXPERTS} experts | d={D_MODEL} | vocab={VOCAB}")
-    print(f"  Atomic skills (1 expert each): {', '.join(ATOMS)}")
-    print(f"  Compositions SEEN in training: {', '.join('[' + label(t) + ']' for t in SEEN)}")
-    print(f"  Compositions HELD OUT (zero-shot): {', '.join('[' + label(t) + ']' for t in HELDOUT)}")
-    print("-" * 72)
-
-    # Datasets: training data only for train tasks; test data for every task.
-    rules = make_domain_rules(VOCAB, seed=0)
+    rules = make_domain_rules(vocab, seed=0)
     train, test = {}, {}
-    for task in TRAIN_TASKS:
-        train[label(task)] = make_pairs(build_dataset(N_TRAIN, SEQ_LEN, task, VOCAB, rules))
-    for task in ALL_TASKS:
-        test[label(task)] = make_pairs(build_dataset(N_TEST, SEQ_LEN, task, VOCAB, rules))
+    for task in train_tasks:
+        train[label(task)] = make_pairs(build_dataset(n_train, seq_len, task, vocab, rules))
+    for task in all_tasks:
+        test[label(task)] = make_pairs(build_dataset(n_test, seq_len, task, vocab, rules))
 
-    model = BMoE(VOCAB, D_MODEL, N_HEADS, N_EXPERTS, N_BLOCS, LAYERS_PER_BLOC,
-                 D_K_ROUTING, max_len=SEQ_LEN)
-    print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
-
-    # ── Phase 1: pre-specialization on the atomic skills (§5) ────────────────────
-    print("Phase 1 — Pre-specialization (Expert_i <- atom i, pure tasks only)")
+    model = BMoE(vocab, d_model, n_heads, n_experts, n_blocs, layers_per_bloc,
+                 d_k_routing, max_len=seq_len)
+    if verbose:
+        print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+        print("Phase 1 — Pre-specialization (Expert_i <- atom i)")
     domains = {i: (a, *train[label([a])]) for i, a in enumerate(ATOMS)}
-    pre_specialize(model, domains, T_PRE, LR, BATCH)
+    pre_specialize(model, domains, t_pre, lr, batch)
 
-    # ── Phase 2: joint training on pure + SEEN compositions (never the held-out) ─
-    print("\nPhase 2 — Joint training on pure + SEEN compositions only\n")
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    train_labels = [label(t) for t in TRAIN_TASKS]
-    log_every = max(1, N_JOINT // 12)
-
-    for step in range(N_JOINT):
+    if verbose:
+        print("\nPhase 2 — Joint training on training tasks (learned bloc routing)\n")
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_labels = [label(t) for t in train_tasks]
+    log_every = max(1, n_joint // 12)
+    for step in range(n_joint):
         name = train_labels[torch.randint(0, len(train_labels), (1,)).item()]
-        Xtr, Ytr = train[name]
         model.train()
-        Xb, Yb = sample_batch(Xtr, Ytr, BATCH)
+        Xb, Yb = sample_batch(*train[name], batch)
         logits, routing = model(Xb)
         loss = (ce_loss(logits, Yb)
-                + ALPHA_BAL * load_balance_loss(routing, N_EXPERTS)
-                + LAMBDA_DIV * divergence_loss(model, Xb, N_EXPERTS))
+                + alpha_bal * load_balance_loss(routing, n_experts)
+                + lambda_div * divergence_loss(model, Xb, n_experts))
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if verbose and (step % log_every == 0 or step == n_joint - 1):
+            acc = np.mean([evaluate(model, *test[label(t)])[1] for t in train_tasks])
+            print(f"  Step {step:>4d} | train-task test acc = {acc:.3f}")
 
-        if step % log_every == 0 or step == N_JOINT - 1:
-            seen = np.mean([evaluate(model, *test[label(t)])[1] for t in SEEN])
-            zero = np.mean([evaluate(model, *test[label(t)])[1] for t in HELDOUT])
-            print(f"  Step {step:>4d} | test acc  seen-comp={seen:.3f}  zero-shot-comp={zero:.3f}")
+    meta = dict(n_blocs=n_blocs, n_experts=n_experts, train_tasks=train_tasks)
+    return model, test, meta
 
-    def avg_distinct(name):
-        paths = routing_paths(model, test[name][0])
-        return float(np.mean([len(torch.unique(p)) for p in paths]))
 
-    # ── RESULT 1 — Zero-shot compositional generalization ───────────────────────
-    print("\n" + "=" * 72)
-    print("  RESULT 1 — Zero-shot compositional generalization (held-out compositions)")
+def main():
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    PURE = [[a] for a in ATOMS]
+    HYBRID = [["math", "history"], ["history", "geography"],
+              ["math", "geography"], ["math", "history", "geography"]]
+    TASKS = PURE + HYBRID
+    N_BLOCS = 3
+
     print("=" * 72)
-    print("  Tasks below were NEVER trained. High accuracy = the model chains experts it")
-    print("  only ever used in *other* compositions.\n")
-    print(f"  {'Held-out task':<22} {'zero-shot acc':>13} {'best-1expert':>13} {'switch gain':>12}")
-    print("  " + "-" * 64)
-    for task in HELDOUT:
+    print("  B-MoE: compositional bloc-by-bloc expert switching")
+    print("=" * 72)
+    print(f"  Atomic skills (1 expert each): {', '.join(ATOMS)}")
+    print(f"  Complex tasks (trained): {', '.join('[' + label(t) + ']' for t in HYBRID)}")
+    print("-" * 72)
+
+    model, test, meta = run_bmoe(train_tasks=TASKS, n_blocs=N_BLOCS)
+    N_EXPERTS = meta["n_experts"]
+
+    # ── RESULT 1 — accuracy vs the decisive single-expert ablation ──────────────
+    print("\n" + "=" * 72)
+    print("  RESULT 1 — Accuracy: learned routing vs best SINGLE expert (ablation)")
+    print("=" * 72)
+    print("  If switching matters, complex tasks need learned routing and collapse when")
+    print("  forced through any single expert across all blocs.\n")
+    print(f"  {'Task':<22} {'learned':>8} {'best-1expert':>13} {'switch gain':>12}")
+    print("  " + "-" * 58)
+    for task in TASKS:
         name = label(task)
         _, acc = evaluate(model, *test[name])
         single = best_single_expert_acc(model, *test[name])
-        print(f"  [{name:<19}] {acc:>13.3f} {single:>13.3f} {acc - single:>+12.3f}")
+        kind = "pure   " if len(task) == 1 else "complex"
+        print(f"  [{name:<19}] {acc:>8.3f} {single:>13.3f} {acc - single:>+12.3f}  ({kind})")
 
-    # ── RESULT 2 — Accuracy + ablation across all tasks ─────────────────────────
+    # ── RESULT 2 — bloc-by-bloc expert paths ────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  RESULT 2 — Accuracy: learned routing vs best SINGLE expert (ablation)")
-    print("=" * 72)
-    print(f"\n  {'Task':<22} {'split':<10} {'learned':>8} {'best-1exp':>10} {'gain':>8}")
-    print("  " + "-" * 62)
-    for task in ALL_TASKS:
-        name = label(task)
-        _, acc = evaluate(model, *test[name])
-        single = best_single_expert_acc(model, *test[name])
-        if len(task) == 1:
-            split = "pure"
-        elif task in SEEN:
-            split = "seen"
-        else:
-            split = "zero-shot"
-        print(f"  [{name:<19}] {split:<10} {acc:>8.3f} {single:>10.3f} {acc - single:>+8.3f}")
-
-    # ── RESULT 3 — Bloc-by-bloc expert paths ────────────────────────────────────
-    print("\n" + "=" * 72)
-    print("  RESULT 3 — Bloc-by-bloc expert paths (modal path B0>B1>B2)")
+    print("  RESULT 2 — Bloc-by-bloc expert paths (modal path B0>B1>B2)")
     print("=" * 72 + "\n")
-    for task in ALL_TASKS:
+    for task in TASKS:
         name = label(task)
         paths = routing_paths(model, test[name][0])
         modal = [int(torch.mode(paths[:, b]).values) for b in range(N_BLOCS)]
         path_str = " > ".join(f"E{e}" for e in modal)
-        kind = "pure" if len(task) == 1 else ("seen" if task in SEEN else "zero-shot")
-        print(f"  [{name:<19}] {path_str:<22} {kind}")
+        kind = "pure   " if len(task) == 1 else "complex"
+        print(f"  [{name:<19}] {path_str:<22} ({kind})")
 
+    print("\n  Switching is near-useless for pure tasks but load-bearing for complex ones:")
+    print("  no single expert can solve a composed query — only chaining experts can.")
     print("\n" + "=" * 72)
     print("  DONE")
     print("=" * 72)

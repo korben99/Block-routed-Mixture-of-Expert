@@ -1,8 +1,0 @@
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://jarvis.local:8090",
-    "ANTHROPIC_API_KEY":  "local"
-  },
-  "maxTokens": 10000,
-  "effortLevel": "low"
-}

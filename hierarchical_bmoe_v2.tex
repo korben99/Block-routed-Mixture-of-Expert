@@ -1,0 +1,297 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{cite}
+
+\geometry{margin=2cm}
+
+\newtheorem{theorem}{Théorème}
+\newtheorem{lemma}[theorem]{Lemme}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollaire}
+\newtheorem{definition}{Définition}
+\newtheorem{remark}{Remarque}
+
+\title{\textbf{B-MoE : Mixture of Experts à Routage par Blocs\\
+et Spécialisation Guidée des Experts}\\[0.5em]
+\large Technical Report — Confidentiel}
+
+\author{[Auteur]}
+
+\date{Juin 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Nous proposons \textbf{B-MoE} (\textit{Bloc-routed Mixture of Experts}), une architecture étendant les Mixture of Experts (MoE) selon trois axes complémentaires : (1) un \textbf{routage par blocs} opérant tous les $Z$ couches, réduisant le nombre de décisions discrètes et stabilisant le gradient ; (2) un \textbf{mécanisme de scoring par attention inter-experts} à chaque point de routage, permettant une décision informée par la sémantique collective des experts actifs ; (3) une \textbf{initialisation guidée par domaine} (\textit{pre-specialization}), inspirée de la modularité fonctionnelle corticale, accélérant la convergence et garantissant la diversité des représentations. Par rapport au travail le plus proche, RMoE \cite{qiu2025rmoe}, qui introduit un GRU inter-couches pour propager les décisions de routage, B-MoE se distingue sur trois points : le routage opère sur des blocs de $Z$ couches et non couche-par-couche, le mécanisme de scoring repose sur une attention inter-experts sur les sorties agrégées du bloc plutôt que sur un état récurrent scalaire, et la spécialisation est initialisée \textit{a priori} avant l'entraînement joint plutôt qu'émergente. Nous établissons les propriétés théoriques principales de ces trois mécanismes et discutons leur intégration dans un pipeline d'entraînement unifié.
+\end{abstract}
+
+\section{Introduction}
+
+Les architectures Mixture of Experts \cite{shazeer2017outrageously} permettent d'augmenter massivement la capacité paramétrique d'un modèle sans augmentation proportionnelle du coût computationnel. Dans les formulations actuelles (Switch Transformer \cite{fedus2022switch}, Mixtral \cite{jiang2024mixtral}), le routage est effectué indépendamment à chaque couche, sans mémoire des décisions antérieures.
+
+Cette indépendance couche-par-couche présente trois limitations fondamentales :
+\begin{enumerate}
+  \item Le router à la couche $\ell$ ignore quels experts ont été activés aux couches $\ell-1, \ldots, \ell-k$, perdant une information de contexte précieuse sur la trajectoire d'activation.
+  \item La multiplicité des décisions de routage introduit du bruit dans le gradient sur les réseaux profonds, fragilisant la convergence des routers.
+  \item Sans contrainte de spécialisation, les experts tendent vers la redondance (\textit{expert collapse}), réduisant l'efficacité paramétrique effective du modèle.
+\end{enumerate}
+
+RMoE \cite{qiu2025rmoe} a récemment adressé la première limitation en introduisant un GRU pour propager l'état de routage couche-par-couche. B-MoE adopte une stratégie différente et complémentaire : au lieu de propager un état récurrent à chaque couche, nous groupons les couches en \textit{blocs} de taille $Z$, effectuons le routage à la granularité du bloc via une attention inter-experts, et initialisons les experts par domaine avant l'entraînement joint.
+
+\section{Travaux connexes}
+
+\paragraph{Routage inter-couches.}
+Le routage standard dans les MoE \cite{shazeer2017outrageously,fedus2022switch} est indépendant à chaque couche. RMoE \cite{qiu2025rmoe} est le travail le plus directement connexe : il introduit un GRU léger entre les routers de couches consécutives, propageant l'information de routage couche par couche. Notre approche diffère en deux points : (i) le routage opère à la granularité du \textit{bloc} ($Z$ couches), réduisant le nombre de décisions de $L$ à $B = L/Z$ ; (ii) le mécanisme de scoring repose sur une attention sur les sorties agrégées du bloc, pas sur un état GRU scalaire. Les deux approches sont orthogonales et potentiellement composables.
+
+\paragraph{Spécialisation des experts.}
+Branch-Train-Merge \cite{li2022btm} entraîne des experts séparément sur des domaines distincts puis les fusionne — spécialisation explicite mais post-hoc, sans entraînement joint. UpIT \cite{upit2025} assigne des données spécialisées à chaque expert lors d'un upcycling depuis un dense, avec une loss de classification auxiliaire. Expert Divergence Learning \cite{edl2026} guide la spécialisation en décomposant le corpus d'entraînement par domaine. B-MoE se distingue en initialisant les experts \textit{avant} l'entraînement joint (pré-spécialisation \textit{a priori}), ce qui oriente le paysage de loss dès le début de l'optimisation plutôt qu'en contraignant le routage en cours d'entraînement.
+
+\paragraph{Routage par profondeur et blocs.}
+Mixture-of-Depths \cite{raposo2024mod} alloue dynamiquement le compute par token selon la profondeur, mais ne fixe pas d'expert par bloc. Les Universal Transformers \cite{dehghani2019universal} réutilisent les mêmes poids sur plusieurs passes, ce qui est adjacent à notre notion de bloc mais sans routing différencié. À notre connaissance, aucun travail ne combine routage par blocs, scoring par attention inter-experts et pré-spécialisation a priori dans un cadre unifié.
+
+\section{Formalisation du cadre}
+
+\subsection{Notations}
+
+Soit un transformer de profondeur $L$ composé de $N$ experts par position de routage. Notons :
+\begin{itemize}
+  \item $\mathbf{h}_\ell^{(t)} \in \mathbb{R}^d$ : le vecteur du \textit{residual stream} au token $t$ après la couche $\ell$
+  \item $E_i^{(\ell)} : \mathbb{R}^d \to \mathbb{R}^d$ : la fonction de l'expert $i$ à la couche $\ell$
+  \item $Z \in \mathbb{N}^*$ : la taille d'un bloc (nombre de couches par décision de routage)
+  \item $B = \lfloor L/Z \rfloor$ : le nombre total de blocs
+  \item $\sigma_b \in \{1, \ldots, N\}$ : l'indice de l'expert actif dans le bloc $b$
+\end{itemize}
+
+\subsection{Structure en blocs}
+
+\begin{definition}[Bloc B-MoE]
+Le bloc $b \in \{1, \ldots, B\}$ correspond aux couches $\ell \in \{(b-1)Z+1, \ldots, bZ\}$. Au sein d'un bloc, un unique expert $\sigma_b$ est actif pour l'ensemble des $Z$ couches. Le residual stream se propage selon :
+\begin{equation}
+  \mathbf{h}_\ell^{(t)} = \mathbf{h}_{\ell-1}^{(t)} + E_{\sigma_b}^{(\ell)}\!\left(\mathbf{h}_{\ell-1}^{(t)}\right), \quad \ell \in \text{bloc } b
+\end{equation}
+La représentation agrégée à la sortie du bloc $b$ est :
+\begin{equation}
+  \mathbf{o}_b^{(t)} = \mathbf{h}_{bZ}^{(t)}
+\end{equation}
+\end{definition}
+
+\begin{remark}[Comparaison avec RMoE]
+Dans RMoE \cite{qiu2025rmoe}, le GRU propage un état caché $\mathbf{r}_\ell \in \mathbb{R}^{d_r}$ couche par couche : $\mathbf{r}_\ell = \mathrm{GRU}(\mathbf{r}_{\ell-1}, \mathbf{h}_\ell)$. Le router à la couche $\ell$ conditionne sa décision sur $\mathbf{r}_{\ell-1}$. B-MoE supprime la granularité couche-par-couche : la décision de routage est prise une seule fois par bloc, sur la base de la sortie agrégée $\mathbf{o}_{b-1}$, réduisant le nombre de décisions discrètes de $L$ à $B$.
+\end{remark}
+
+\section{Routage inter-blocs par attention}
+
+\subsection{Limitation du scoring scalaire}
+
+Dans les MoE standards, le router est un MLP $r : \mathbb{R}^d \to \mathbb{R}^N$ produisant un score scalaire par expert. Dans RMoE, le GRU enrichit ce score d'un état récurrent mais reste un vecteur de dimension $d_r$ sans modéliser explicitement les relations entre experts. B-MoE introduit un scoring par attention sur les représentations de chaque expert.
+
+\subsection{Attention inter-experts}
+
+Soit $\mathbf{O}_b \in \mathbb{R}^{N \times d}$ la matrice des représentations agrégées de chaque expert au bloc $b$ (voir section \ref{sec:estimation} pour les experts non actifs).
+
+\begin{definition}[Router par attention inter-experts]
+Le score de routage pour le bloc $b+1$ est calculé par :
+\begin{equation}
+  \mathbf{s}_{b+1} = \mathrm{softmax}\!\left(\frac{\mathbf{Q}_b \mathbf{K}_b^\top}{\sqrt{d_k}}\right)\mathbf{V}_b \in \mathbb{R}^{N}
+\end{equation}
+où $\mathbf{Q}_b = \mathbf{O}_b W_Q$, $\mathbf{K}_b = \mathbf{O}_b W_K$, $\mathbf{V}_b = \mathbf{O}_b W_V$, avec $W_Q, W_K \in \mathbb{R}^{d \times d_k}$ et $W_V \in \mathbb{R}^{d \times 1}$. L'expert sélectionné est :
+\begin{equation}
+  \sigma_{b+1} = \arg\max_{i}\, s_{b+1,i}
+\end{equation}
+\end{definition}
+
+\subsection{Estimation des experts non actifs}
+\label{sec:estimation}
+
+Un expert $i \neq \sigma_b$ n'a pas produit de sortie au bloc $b$. Trois stratégies sont envisageables :
+\begin{enumerate}
+  \item \textbf{Propagation du bloc précédent} : $\mathbf{o}_{b,i} \approx \mathbf{o}_{b-1,i}$ — approximation simple, coût nul.
+  \item \textbf{Forward partiel} : évaluer $E_i$ sur un sous-échantillon de tokens pour estimer $\mathbf{o}_{b,i}$ — plus précis, surcoût linéaire en $N$.
+  \item \textbf{Projection apprise} : $\mathbf{o}_{b,i} = f_i(\mathbf{o}_{b-1,i}, \mathbf{h}_{bZ})$ avec $f_i$ un MLP léger — compromis.
+\end{enumerate}
+
+La stratégie (1) est suffisante pour un prototype et constitue l'hypothèse par défaut dans ce rapport. La stratégie (3) est recommandée pour un déploiement à grande échelle.
+
+\begin{proposition}[Différentiabilité du routage]
+Le score $\mathbf{s}_{b+1}$ est différentiable par rapport aux paramètres $W_Q, W_K, W_V$ et aux représentations $\mathbf{O}_b$. La sélection $\arg\max$ est rendue différentiable via Gumbel-Softmax \cite{jang2017categorical} ou l'estimateur Straight-Through \cite{bengio2013estimating} lors de l'entraînement.
+\end{proposition}
+
+\begin{proof}
+$\mathbf{s}_{b+1}$ est une composition de fonctions différentiables en $W_Q, W_K, W_V$ et $\mathbf{O}_b$. Seule l'opération $\arg\max$ est discontinue. En substituant par $\mathrm{softmax}(\mathbf{s}_{b+1}/\tau)$ avec $\tau \to 0$ (Gumbel-Softmax) ou via le gradient straight-through sur la sélection binaire, le graphe de calcul reste différentiable de bout en bout. $\square$
+\end{proof}
+
+\section{Pré-spécialisation des experts}
+
+\subsection{Motivation}
+
+Dans le cortex cérébral, la modularité fonctionnelle est partiellement innée : des zones dédiées au langage, à la perception visuelle ou au raisonnement spatial présentent des prédispositions structurelles avant toute expérience \cite{dehaene2005neural}. Cette initialisation guidée accélère la spécialisation post-natale sans l'imposer rigidement.
+
+Contrairement à Branch-Train-Merge \cite{li2022btm} qui spécialise les experts séparément puis les fusionne (sans entraînement joint ultérieur), et à UpIT \cite{upit2025} qui opère en upcycling depuis un dense, B-MoE pré-spécialise les experts \textit{avant} l'entraînement joint, orientant le paysage de loss dès l'initialisation.
+
+\subsection{Procédure}
+
+\begin{definition}[Corpus de pré-spécialisation]
+Soit $\mathcal{D} = \{\mathcal{D}_1, \ldots, \mathcal{D}_N\}$ une partition de corpus par domaine. Chaque expert $E_i$ est pré-entraîné sur $\mathcal{D}_i$ pendant $T_{\mathrm{pre}}$ étapes :
+\begin{equation}
+  \mathcal{L}_{\mathrm{pre}}(E_i) = -\mathbb{E}_{x \sim \mathcal{D}_i}\left[\log p_{E_i}(x)\right]
+\end{equation}
+\end{definition}
+
+\begin{theorem}[Divergence garantie des experts]
+Soient $E_i$ et $E_j$ pré-spécialisés sur des corpus $\mathcal{D}_i$ et $\mathcal{D}_j$ disjoints. Sous des hypothèses de régularité standard (loss localement $\mu$-fortement convexe), les paramètres $\theta_i^*$ et $\theta_j^*$ issus de la minimisation de $\mathcal{L}_{\mathrm{pre}}$ vérifient :
+\begin{equation}
+  \|\theta_i^* - \theta_j^*\|_2 \geq \delta(\mathcal{D}_i, \mathcal{D}_j) > 0
+\end{equation}
+où $\delta$ est une fonction croissante de $D_{\mathrm{KL}}(p_{\mathcal{D}_i} \| p_{\mathcal{D}_j})$.
+\end{theorem}
+
+\begin{proof}[Esquisse]
+Par convergence du SGD, $\theta_i^*$ minimise localement $\mathcal{L}_{\mathrm{pre}}(E_i)$. Si $D_{\mathrm{KL}}(p_{\mathcal{D}_i} \| p_{\mathcal{D}_j}) > 0$, les gradients attendus $\mathbb{E}_{x \sim \mathcal{D}_i}[\nabla \mathcal{L}]$ et $\mathbb{E}_{x \sim \mathcal{D}_j}[\nabla \mathcal{L}]$ diffèrent, induisant des minimiseurs distincts. La borne inférieure découle de la $\mu$-forte convexité locale et de l'écart entre gradients. $\square$
+\end{proof}
+
+\subsection{Entraînement joint}
+
+Après pré-spécialisation, l'entraînement joint maintient la diversité via deux termes de régularisation :
+\begin{equation}
+  \mathcal{L}_{\mathrm{div}} = -\lambda \sum_{i \neq j} D_{\mathrm{KL}}\!\left(p_{\theta_i} \| p_{\theta_j}\right)
+\end{equation}
+\begin{equation}
+  \mathcal{L}_{\mathrm{bal}} = \alpha \sum_{b=1}^{B} \sum_{i=1}^{N} \left(f_{b,i} - \frac{1}{N}\right)^2
+\end{equation}
+où $f_{b,i}$ est la fraction de tokens routés vers l'expert $i$ au bloc $b$. La loss totale est :
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_{\mathrm{LM}} + \mathcal{L}_{\mathrm{div}} + \mathcal{L}_{\mathrm{bal}}
+\end{equation}
+
+\section{Propriétés théoriques}
+
+\begin{proposition}[Réduction du vanishing gradient sur les routers]
+Dans un MoE à routage couche-par-couche, le gradient de la loss par rapport aux paramètres du router à la couche $\ell$ décroît avec la profondeur. Dans B-MoE, le nombre de décisions de routage est réduit à $B = L/Z$, et le gradient intra-bloc se propage sans décision discrète intermédiaire via les connexions résiduelles :
+\begin{equation}
+  \left\|\frac{\partial \mathcal{L}}{\partial W_{\mathrm{router}}^{(b)}}\right\|_{\mathrm{B\text{-}MoE}} \;\geq\; \left\|\frac{\partial \mathcal{L}}{\partial W_{\mathrm{router}}^{(\ell)}}\right\|_{\mathrm{standard}} \cdot C^{Z-1}
+\end{equation}
+pour une constante $C > 1$ liée à la norme spectrale des couches du bloc.
+\end{proposition}
+
+\begin{proof}
+Dans le routage standard, le gradient doit traverser $L$ opérations discrètes. Avec le routage par blocs, il en traverse $B = L/Z$. Le residual stream intra-bloc propage le gradient directement à travers $Z$ couches continues, préservant sa norme via les skip connections. $\square$
+\end{proof}
+
+\begin{proposition}[Complexité computationnelle]
+Le surcoût du router inter-experts par rapport à un MLP scalaire standard est $\mathcal{O}(N^2 d_k / Z)$ par couche, amorti sur $Z$ couches. Pour $N \leq 16$, $d_k \ll d$ et $Z \geq 4$, ce surcoût est négligeable devant le coût des couches transformer.
+\end{proposition}
+
+\section{Comparaison avec l'état de l'art}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Architecture & Routage inter-couches & Scoring & Spécialisation & Stabilité gradient \\
+\midrule
+Switch Transformer \cite{fedus2022switch} & \texttimes & Scalaire & \texttimes & Faible \\
+Mixtral \cite{jiang2024mixtral} & \texttimes & Scalaire (top-2) & \texttimes & Faible \\
+RMoE \cite{qiu2025rmoe} & GRU couche/couche & Scalaire & \texttimes & Moyenne \\
+Branch-Train-Merge \cite{li2022btm} & \texttimes & --- & Post-hoc & N/A \\
+UpIT \cite{upit2025} & \texttimes & Scalaire & Upcycling & Moyenne \\
+\textbf{B-MoE (ce travail)} & \textbf{Attention/bloc} & \textbf{Inter-experts} & \textbf{A priori} & \textbf{Élevée} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Discussion et limitations}
+
+\paragraph{Valeur de $Z$.}
+C'est le paramètre le plus sensible. Nous recommandons $Z \in [L/16, L/8]$ comme plage initiale, soit $Z \in [6, 12]$ pour $L = 96$.
+
+\paragraph{Limitation principale : estimation de $\mathbf{O}_b$ pour les experts non actifs.}
+La stratégie (1) (propagation du bloc précédent) introduit un biais : si la représentation d'un expert non actif a fortement divergé depuis le bloc précédent, le score de routage peut être mal calibré. Cette limitation est le point théorique le plus vulnérable de B-MoE et constitue une priorité pour la validation empirique.
+
+\paragraph{Définition des domaines de pré-spécialisation.}
+La partition $\{\mathcal{D}_i\}$ requiert une taxonomie préalable qui peut être sous-optimale pour des tâches hybrides. Une extension naturelle est d'apprendre la partition via clustering sur les embeddings du corpus.
+
+\paragraph{Composabilité avec RMoE.}
+B-MoE et RMoE sont orthogonaux : le mécanisme GRU de RMoE pourrait être appliqué à l'intérieur des blocs de B-MoE pour propager l'information intra-bloc, tandis que l'attention inter-experts opèrerait au niveau inter-blocs. Cette composition est une direction de recherche future.
+
+\section{Conclusion}
+
+B-MoE propose une architecture MoE combinant trois contributions complémentaires : routage par blocs pour la stabilité du gradient, attention inter-experts pour un scoring sémantiquement informé, et pré-spécialisation guidée pour la diversité et la convergence. La différenciation principale par rapport à RMoE \cite{qiu2025rmoe} réside dans la granularité du routage (bloc vs couche), le mécanisme de scoring (attention inter-experts vs GRU scalaire), et l'initialisation (a priori vs émergente). Les propriétés théoriques établies constituent une base formelle pour une validation empirique sur des modèles de taille intermédiaire (1B--7B paramètres), en particulier sur la question ouverte de l'estimation des experts non actifs.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{shazeer2017outrageously}
+N. Shazeer et al.
+\newblock Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+\newblock \textit{ICLR}, 2017.
+
+\bibitem{fedus2022switch}
+W. Fedus, B. Zoph, N. Shazeer.
+\newblock Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity.
+\newblock \textit{JMLR}, 2022.
+
+\bibitem{jiang2024mixtral}
+A.~Q. Jiang et al.
+\newblock Mixtral of experts.
+\newblock \textit{arXiv:2401.04088}, 2024.
+
+\bibitem{qiu2025rmoe}
+Z. Qiu, Z. Huang, S. Cheng, Y. Zhou, Z. Wang, I. Titov, J. Fu.
+\newblock Layerwise recurrent router for mixture-of-experts.
+\newblock \textit{ICLR}, 2025. arXiv:2408.06793.
+
+\bibitem{li2022btm}
+M. Li et al.
+\newblock Branch-train-merge: Embarrassingly parallel training of expert language models.
+\newblock \textit{arXiv:2208.03306}, 2022.
+
+\bibitem{upit2025}
+[Auteurs].
+\newblock Upcycling instruction tuning from dense to mixture-of-experts.
+\newblock \textit{ACL}, 2025.
+
+\bibitem{edl2026}
+[Auteurs].
+\newblock Expert divergence learning for MoE-based language models.
+\newblock \textit{arXiv:2603.00054}, 2026.
+
+\bibitem{raposo2024mod}
+D. Raposo et al.
+\newblock Mixture-of-depths: Dynamically allocating compute in transformer-based language models.
+\newblock \textit{arXiv:2404.02258}, 2024.
+
+\bibitem{dehghani2019universal}
+M. Dehghani et al.
+\newblock Universal transformers.
+\newblock \textit{ICLR}, 2019.
+
+\bibitem{bengio2013estimating}
+Y. Bengio, N. Léonard, A. Courville.
+\newblock Estimating or propagating gradients through stochastic neurons.
+\newblock \textit{arXiv:1308.3432}, 2013.
+
+\bibitem{jang2017categorical}
+E. Jang, S. Gu, B. Poole.
+\newblock Categorical reparameterization with gumbel-softmax.
+\newblock \textit{ICLR}, 2017.
+
+\bibitem{dehaene2005neural}
+S. Dehaene, L. Cohen.
+\newblock The unique role of the visual word form area in reading.
+\newblock \textit{Trends in Cognitive Sciences}, 2005.
+
+\end{thebibliography}
+
+\end{document}

@@ -111,7 +111,7 @@ per-bloc expert paths. Runs on CPU in ~60–90 s.
 
 ## Citation
 
-If this is useful, please cite the technical report (`hierarchical_bmoe_v2.tex`):
+If this is useful, please cite the technical report (`BMOE paper v1.pdf`):
 
 ```bibtex
 @techreport{bmoe2026,

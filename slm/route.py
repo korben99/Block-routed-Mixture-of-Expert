@@ -66,9 +66,11 @@ def autonomous_route(model, Xd, Yd, beam=2, max_depth=3, thr=0.999
 
 
 @torch.no_grad()
-def exhaustive_route(model, Xd, Yd, max_depth=3, thr=0.999
-                     ) -> Tuple[Optional[List[str]], int]:
-    """Brute-force baseline: every chain shortest-first, verified on the demos."""
+def critic_route(model, Xd, Yd, max_depth=3, thr=0.999
+                 ) -> Tuple[Optional[List[str]], int]:
+    """Primary self-routing (the proven mechanism, poc4/bmoe_cyber): propose chains shortest-
+    first over the model's own experts; the sufficiency critic accepts the first that
+    reproduces the demos. No router, no expert tag — just demos + verification."""
     explored = 0
     for length in range(1, max_depth + 1):
         for combo in itertools.product(ATOMS, repeat=length):
@@ -76,3 +78,22 @@ def exhaustive_route(model, Xd, Yd, max_depth=3, thr=0.999
             if _verifies(model, Xd, Yd, list(combo), thr):
                 return list(combo), explored
     return None, explored
+
+
+# back-compat alias
+exhaustive_route = critic_route
+
+
+@torch.no_grad()
+def proposer_topk_acc(model, Xd, true_chain: List[str], k: int = 1) -> float:
+    """Quality of the LEARNED proposer: walking the true chain, how often is the correct next
+    skill in the router's top-k from the current (model-decoded) state. On content-ambiguous
+    bytes this is low (the map<->decomposition ambiguity) — its payoff is the structured/fuzzy
+    stage. Averaged over the steps of the chain."""
+    hits, state = 0, Xd
+    for i, name in enumerate(true_chain):
+        probs = model.propose(state)                        # (N,)
+        topk = probs.topk(min(k, probs.numel())).indices.tolist()
+        hits += int(EXPERT_ID[name] in topk)
+        state = apply_chain(model, Xd, true_chain[:i + 1])
+    return hits / max(len(true_chain), 1)

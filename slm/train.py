@@ -27,11 +27,11 @@ ID2NAME = {v: k for k, v in EXPERT_ID.items()}
 def pre_specialize(model: BlocRoutedMoESLM, P, S=24, bs=64, steps=1500, lr=2e-3):
     cfg = model.cfg
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    # context-dependent experts (stream) need the shared attention to learn a t-1 gather,
-    # which the pointwise experts pull toward identity — so oversample them.
+    # context-dependent experts (transpose) need the shared attention to learn a neighbour
+    # gather, which the pointwise experts pull toward identity — so oversample them.
     schedule = []
     for e in range(N_EXPERTS):
-        schedule += [e] * (3 if ID2NAME[e] == "stream" else 1)
+        schedule += [e] * (3 if ID2NAME[e] == "shift" else 1)
     for step in range(steps):
         e = schedule[step % len(schedule)]
         name = ID2NAME[e]

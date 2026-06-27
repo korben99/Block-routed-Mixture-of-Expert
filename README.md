@@ -46,6 +46,12 @@ Two ingredients make it work:
 **triple** — are solved **zero-shot at 1.00 accuracy**, with the model choosing the chain
 itself. No router, no task tokens.
 
+**Same mechanism, concrete domain (security):** instantiated as *autonomous
+deobfuscation-pipeline discovery*, the model recovers the inverse decoding chain for
+attacker obfuscation **stacks it never trained on**, from a handful of example pairs —
+**0.998 zero-shot** decode, pipelines recovered correctly, no router. See
+[*A concrete instantiation*](#a-concrete-instantiation-autonomous-deobfuscation-security).
+
 ---
 
 ## The experience (how we got there)
@@ -76,12 +82,64 @@ pip install -r requirements.txt          # torch, numpy
 python bmoe_loop.py    # composability: loop + re-grounding cracks the triple   (~35 s)
 python bmoe_poc.py     # dual-stream loop with a context-dependent skill (MPS)  (~40 s)
 python bmoe_poc4.py    # THE result: autonomous critic-guided routing (MPS)     (~20 s)
+python bmoe_cyber.py   # the same mechanism on a security task (MPS)            (~20 s)
 ```
 
 `bmoe_poc4.py` prints, for each held-out task, the **chain the model chose by itself** and
 its zero-shot accuracy. The journey scripts (`bmoe_compose/diagnose/lever1/lever2`) and the
 original bloc-routing demos (`toyBMoE.py`, `bmoe_text.py`) are documented in `README.old.md`.
 Apple-Silicon GPU (MPS) is used automatically when available.
+
+---
+
+## A concrete instantiation: autonomous deobfuscation (security)
+
+The toy above removes every confound to prove the *mechanism*. To show it is not tied to
+abstract maps, [`bmoe_cyber.py`](bmoe_cyber.py) instantiates the **exact same architecture**
+(loop of shared skills + token re-grounding + sufficiency critic, paper §6.6) on a concrete
+security task — and nothing about the architecture changes, only the meaning of the skills.
+
+**The problem.** Attackers hide a payload behind a *stack* of cheap, reversible obfuscation
+layers — a single-byte XOR key, a custom substitution alphabet (S-box / non-standard
+base64), a rolling/CBC stream where each byte is masked by the previous one. The stack
+evades static signatures because the *combination* is unseen even when each layer is well
+known. A defender must recover the right **inverse decoding pipeline** — which decoders, in
+which order — for arbitrary, never-before-seen layerings.
+
+**The skills are decoders.** Each atomic primitive becomes one inverse layer:
+
+| Skill | Security meaning | Type |
+|---|---|---|
+| `caesar` | undo single-byte XOR / additive key | token-wise |
+| `sbox` | invert a custom substitution alphabet (S-box) | token-wise |
+| `stream` | undo a rolling / CBC keystream (byte *t* masked by byte *t–1*) | **context-dependent** |
+
+`stream` is invertible **only** with the per-step context view — the same load-bearing-context
+result as the toy's `delta`, now motivated by an actual stream cipher (it collapses
+`0.996 → 0.076` without context).
+
+**Incident response, autonomously.** The model is handed a few `(obfuscated → revealed)`
+example pairs an analyst extracted (the few-shot demos) plus fresh captured traffic. With no
+router and no "which-decoder" tag, it proposes decoding chains shortest-first; the
+sufficiency critic accepts the shortest that reproduces the revealed bytes on the demos;
+that recovered pipeline is applied to the new traffic. The two held-out incidents use
+obfuscation **stacks the model never trained on**:
+
+| Attacker stack | Split | Decoded | Recovered pipeline |
+|---|:---:|:---:|---|
+| `caesar` | seen | 1.000 | `caesar` ✓ |
+| `sbox` | seen | 1.000 | `sbox` ✓ |
+| `stream` | seen | 0.996 | `stream` ✓ |
+| `sbox › caesar` | **zero-shot** | 1.000 | `sbox › caesar` ✓ |
+| `sbox › caesar › stream` | **zero-shot** | 0.996 | `sbox › caesar › stream` ✓ |
+
+Zero-shot decode **0.998**, both unseen pipelines recovered correctly — the model
+reconstructs the decoding chain *itself* and decodes traffic hidden behind a layering it
+never saw. This is exactly the paper's *propose-and-verify* routing (§6.6), now reading as a
+security capability: **given a couple of decoded examples, recover the deobfuscation pipeline
+for an unseen obfuscation stack.** At scale (next section) the exact-match critic becomes a
+learned *"is-this-revealed?"* judge and the exhaustive search becomes a guided proposer — an
+agentic decode loop.
 
 ---
 
@@ -134,6 +192,10 @@ removes every confound and shows the loop is sound; scaling supplies the missing
 
 - ✅ Proven: the loop + re-grounding makes skills compose zero-shot; a sufficiency critic +
   few-shot demos lets the model route itself, zero-shot, with no router and no task token.
+- ✅ The security instantiation (`bmoe_cyber.py`) is the **same mechanism**, not a new claim:
+  decoders are deterministic, the critic is exact-match on the demos, and the search is
+  exhaustive (`N^K`, fine for a handful of layers). It demonstrates the *capability shape*
+  (recover an unseen deobfuscation pipeline from examples), not a production decoder zoo.
 - ⚠️ The critic is exact token-match on the demos and routing is exhaustive search — robust
   for a handful of skills, **not** the scalable form (see swaps above).
 - ⚠️ The *semantic* "is-this-complete" judgment is **not** demonstrated by tiny toy experts;

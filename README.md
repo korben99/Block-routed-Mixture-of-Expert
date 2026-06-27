@@ -10,7 +10,7 @@ them to solve compositions it was never trained on.**
 
 > This is the **research-frontier** README: the loop architecture and the autonomous
 > "route-yourself" result. The original **B-MoE bloc-routing** validation (paper §3–5,
-> ablations, real-token LM) lives in [`README.old.md`](README.old.md).
+> ablations, real-token LM) lives in [`README.old.md`](Old/README.old.md).
 
 ---
 
@@ -70,7 +70,8 @@ individually / in other combinations; the target combination held out).
 | `bmoe_poc2/3.py` | parametric / decentralized router from demos | ~0.03 | a head **can't infer the chain** from a net map (ambiguous) |
 | **`bmoe_poc4.py`** | **sufficiency critic + few-shot demos** | **1.00** | **the model routes itself**, zero-shot, no token |
 
-Full narrative and the bloc-routing ablations: [`README.old.md`](README.old.md).
+The journey scripts and the original bloc-routing demos are archived under
+[`Old/`](Old/); full narrative and ablations: [`README.old.md`](Old/README.old.md).
 
 ---
 
@@ -79,15 +80,17 @@ Full narrative and the bloc-routing ablations: [`README.old.md`](README.old.md).
 ```bash
 pip install -r requirements.txt          # torch, numpy
 
-python bmoe_loop.py    # composability: loop + re-grounding cracks the triple   (~35 s)
-python bmoe_poc.py     # dual-stream loop with a context-dependent skill (MPS)  (~40 s)
-python bmoe_poc4.py    # THE result: autonomous critic-guided routing (MPS)     (~20 s)
-python bmoe_cyber.py   # the same mechanism on a security task (MPS)            (~20 s)
+python Old/bmoe_loop.py   # composability: loop + re-grounding cracks the triple (~35 s)
+python Old/bmoe_poc.py    # dual-stream loop with a context-dependent skill (MPS)(~40 s)
+python Old/bmoe_poc4.py   # THE result: autonomous critic-guided routing (MPS)   (~20 s)
+python bmoe_cyber.py      # the same mechanism on a security task (MPS)          (~20 s)
+python eval_incidents.py  # pre-production deobf engine on real decoders (CPU)   (~ 1 s)
 ```
 
-`bmoe_poc4.py` prints, for each held-out task, the **chain the model chose by itself** and
-its zero-shot accuracy. The journey scripts (`bmoe_compose/diagnose/lever1/lever2`) and the
-original bloc-routing demos (`toyBMoE.py`, `bmoe_text.py`) are documented in `README.old.md`.
+`Old/bmoe_poc4.py` prints, for each held-out task, the **chain the model chose by itself** and
+its zero-shot accuracy. The journey scripts (`Old/bmoe_compose/diagnose/lever1/lever2`) and the
+original bloc-routing demos (`Old/toyBMoE.py`, `Old/bmoe_text.py`) are documented in
+[`Old/README.old.md`](Old/README.old.md).
 Apple-Silicon GPU (MPS) is used automatically when available.
 
 ---
@@ -141,6 +144,12 @@ for an unseen obfuscation stack.** At scale (next section) the exact-match criti
 learned *"is-this-revealed?"* judge and the exhaustive search becomes a guided proposer — an
 agentic decode loop.
 
+> **Pre-production.** The same loop, instantiated on *real* decoders (pure-stdlib, no model),
+> is the [`deobf/`](deobf/README.md) engine: an analyst gives 3–5 `(obfuscated → revealed)`
+> pairs from an incident and it recovers the decoding pipeline of an unseen campaign, then
+> replays it on the rest of the captured traffic. Five ground-truth incidents recovered in
+> ≈ 1 s — see [`deobf/README.md`](deobf/README.md) and `python eval_incidents.py`.
+
 ---
 
 ## Scaling it up (toy → LLM)
@@ -173,7 +182,7 @@ to scale; **the rest of the architecture transfers unchanged.**
 **Training recipe at scale**
 
 1. **Pre-specialize** each expert/adapter on its domain and keep them distinct (the B-MoE
-   pre-specialization + divergence idea — see `README.old.md`).
+   pre-specialization + divergence idea — see `Old/README.old.md`).
 2. Train the **verifier** (sufficiency critic).
 3. Bootstrap the **proposer**: imitate good chains found by search/self-play, then improve
    with RL using the verifier as reward.
@@ -205,4 +214,4 @@ removes every confound and shows the loop is sound; scaling supplies the missing
 ## License
 
 Released under the [MIT License](LICENSE). Origin & formal write-up:
-[`hierarchical_bmoe_v2.tex`](hierarchical_bmoe_v2.tex), [`README.old.md`](README.old.md).
+[`hierarchical_bmoe_v3.tex`](hierarchical_bmoe_v3.tex), [`README.old.md`](Old/README.old.md).
